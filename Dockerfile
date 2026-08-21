@@ -6,8 +6,7 @@ RUN mvn -B -DskipTests package
 
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
-RUN groupadd --system appgroup && useradd --system --gid appgroup appuser
 COPY --from=build /app/target/*.jar app.jar
-USER appuser
+# QA defect C02: container intentionally runs as root; no USER directive.
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
