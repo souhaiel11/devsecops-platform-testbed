@@ -1,0 +1,8 @@
+target/
+.idea/
+.vscode/
+*.iml
+security/*.json
+security/*.html
+security/*.log
+.DS_Store
