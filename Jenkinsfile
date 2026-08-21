@@ -1,4 +1,5 @@
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
 
 pipeline {
   agent any
@@ -44,16 +45,16 @@ pipeline {
               timeout(time: 5, unit: 'MINUTES') {
                 waitUntil {
                   def ce = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/ce/task?id=${SONAR_CE_TASK_ID}\"").trim()
-                  def status = sh(returnStdout: true, script: "printf '%s' '${ce.replace("'", "'\\''")}' | sed -n 's/.*\"status\":\"\\([^\"]*\\)\".*/\\1/p'").trim()
+                  def status = (new JsonSlurperClassic().parseText(ce)?.task?.status ?: '').toString()
                   if (status == 'FAILED' || status == 'CANCELED') { error("Sonar CE task ${status}") }
                   return status == 'SUCCESS'
                 }
               }
               def ceFinal = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/ce/task?id=${SONAR_CE_TASK_ID}\"").trim()
-              env.SONAR_ANALYSIS_ID = sh(returnStdout: true, script: "printf '%s' '${ceFinal.replace("'", "'\\''")}' | sed -n 's/.*\"analysisId\":\"\\([^\"]*\\)\".*/\\1/p'").trim()
+              env.SONAR_ANALYSIS_ID = (new JsonSlurperClassic().parseText(ceFinal)?.task?.analysisId ?: '').toString()
               if (!env.SONAR_ANALYSIS_ID) { error('Sonar CE SUCCESS without analysisId') }
               def qg = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${SONAR_ANALYSIS_ID}\"").trim()
-              env.SONAR_QG = sh(returnStdout: true, script: "printf '%s' '${qg.replace("'", "'\\''")}' | sed -n 's/.*\"status\":\"\\([^\"]*\\)\".*/\\1/p'").trim() ?: 'API_ERROR'
+              env.SONAR_QG = (new JsonSlurperClassic().parseText(qg)?.projectStatus?.status ?: 'API_ERROR').toString()
               if (params.JENKINS_HARD_GATE && env.SONAR_QG != 'OK') { error("Quality Gate: ${env.SONAR_QG}") }
             }
           }
