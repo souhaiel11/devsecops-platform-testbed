@@ -13,10 +13,7 @@ public class SecurityHeadersFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
-        response.setHeader("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'");
-        response.setHeader("X-Content-Type-Options", "nosniff");
-        response.setHeader("X-Frame-Options", "DENY");
-        response.setHeader("Referrer-Policy", "no-referrer");
+        // QA defect: security headers intentionally omitted on this scenario branch.
         filterChain.doFilter(request, response);
     }
 }
