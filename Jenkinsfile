@@ -23,6 +23,13 @@ pipeline {
     stage('Build') {
       steps { sh 'mvn -B clean package -DskipTests -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
     }
+    stage('QA Jenkins Command') {
+      steps {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+          sh 'qa-tool-that-does-not-exist --version'
+        }
+      }
+    }
     stage('Tests') {
       steps {
         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
