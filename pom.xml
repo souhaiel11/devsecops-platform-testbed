@@ -29,6 +29,11 @@
       <artifactId>spring-boot-starter-test</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>com.qa.nonexistent</groupId>
+      <artifactId>artifact-does-not-exist</artifactId>
+      <version>99.99.99</version>
+    </dependency>
   </dependencies>
   <build>
     <plugins>
