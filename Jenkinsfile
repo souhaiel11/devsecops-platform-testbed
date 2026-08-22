@@ -143,6 +143,7 @@ pipeline {
                        event: "pipeline_${currentBuild.currentResult.toLowerCase()}",
                        repository: 'souhaiel11/devsecops-platform-testbed',
                        jenkinsJob: env.JOB_NAME,
+                       job: env.JOB_NAME,
                        buildNumber: env.BUILD_NUMBER as Integer,
                        buildUrl: env.BUILD_URL,
                        jenkinsStatus: currentBuild.currentResult,
