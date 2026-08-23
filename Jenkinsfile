@@ -1,6 +1,25 @@
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurperClassic
 
+// ── Vérité structurée par étage (CPS-safe, hors environment{}) ─────────
+// Root cause confirmée sur build #10 : les variables déclarées dans le
+// bloc pipeline-level environment{} sont ré-évaluées/réinitialisées à
+// l'entrée de CHAQUE étage suivante, ce qui écrase silencieusement toute
+// affectation env.X faite dans une étage précédente (preuve : TESTS_TOTAL
+// valait '2' juste après l'étage Tests, et '0' — sa valeur par défaut
+// environment{} — au moment du post{always} pipeline-level, alors qu'aucun
+// test n'a échoué entre-temps). Ces variables `def` top-level, elles,
+// appartiennent au contexte d'exécution du script CPS lui-même et
+// survivent aux frontières d'étage et aux points de suspension des steps.
+// Types strictement primitifs (String/Integer) — jamais un objet
+// LazyMap/JsonSlurper/résultat de plugin retenu ici, pour rester
+// sérialisable au sens CPS.
+def buildStageStatus = 'UNKNOWN'
+def testStageStatus = 'UNKNOWN'
+def testsTotal = 0
+def testsFailures = 0
+def dockerBuildStatus = 'UNKNOWN'
+
 pipeline {
   agent any
   tools { maven 'M3' }
@@ -18,19 +37,6 @@ pipeline {
     SONAR_ANALYSIS_ID = ''
     SONAR_QG = 'NOT_RUN'
     ZAP_STATE = 'NOT_RUN'
-    // Vérité structurée par étage, capturée AU MOMENT de l'étage (pas
-    // reconstruite depuis currentBuild.result en fin de pipeline) — un
-    // scanner en échec plus loin (Sonar/Trivy/OWASP/ZAP) ne doit jamais
-    // rétroactivement changer BUILD_STATUS/TEST_STATUS/DOCKER_BUILD_STATUS.
-    // Défaut 'UNKNOWN' (pas 'NOT_REACHED') : c'est le sentinel que
-    // Merge All Fetched Data (WF1) reconnaît déjà pour dériver NOT_REACHED
-    // côté plateforme quand buildFailed=true — convention existante,
-    // pas inventée ici (vérifié par test offline avant d'écrire ceci).
-    BUILD_STATUS = 'UNKNOWN'
-    TEST_STATUS = 'UNKNOWN'
-    TESTS_TOTAL = '0'
-    TESTS_FAILURES = '0'
-    DOCKER_BUILD_STATUS = 'UNKNOWN'
   }
   stages {
     stage('Build') {
@@ -38,9 +44,9 @@ pipeline {
         script {
           try {
             sh 'mvn -B clean package -DskipTests -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
-            env.BUILD_STATUS = 'SUCCESS'
+            buildStageStatus = 'SUCCESS'
           } catch (e) {
-            env.BUILD_STATUS = 'FAILED'
+            buildStageStatus = 'FAILED'
             throw e
           }
         }
@@ -52,9 +58,9 @@ pipeline {
           script {
             try {
               sh 'mvn -B test -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
-              env.TEST_STATUS = 'SUCCESS'
+              testStageStatus = 'SUCCESS'
             } catch (e) {
-              env.TEST_STATUS = 'FAILED'
+              testStageStatus = 'FAILED'
               throw e
             }
           }
@@ -64,8 +70,8 @@ pipeline {
         always {
           script {
             def summary = junit(allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml')
-            env.TESTS_TOTAL = "${summary.totalCount}"
-            env.TESTS_FAILURES = "${summary.failCount}"
+            testsTotal = summary.totalCount as Integer
+            testsFailures = summary.failCount as Integer
           }
         }
       }
@@ -105,9 +111,9 @@ pipeline {
         script {
           try {
             sh 'docker build -t "$IMAGE_NAME" .'
-            env.DOCKER_BUILD_STATUS = 'SUCCESS'
+            dockerBuildStatus = 'SUCCESS'
           } catch (e) {
-            env.DOCKER_BUILD_STATUS = 'FAILED'
+            dockerBuildStatus = 'FAILED'
             throw e
           }
         }
@@ -204,13 +210,15 @@ pipeline {
                        // uniquement) — buildStageStatus est un champ dédié, distinct de
                        // jenkinsStatus (résultat global du pipeline) pour ne jamais confondre
                        // "Build a réussi" avec "le pipeline global est UNSTABLE à cause de Sonar".
-                       buildStageStatus: env.BUILD_STATUS,
-                       tests: [status: env.TEST_STATUS,
-                               total: (env.TESTS_TOTAL ?: '0') as Integer,
-                               failures: (env.TESTS_FAILURES ?: '0') as Integer,
+                       // Lu depuis les variables de script top-level (pas env.*) : voir la
+                       // note en tête de fichier — environment{} ne survit pas aux étages.
+                       buildStageStatus: buildStageStatus,
+                       tests: [status: testStageStatus,
+                               total: testsTotal,
+                               failures: testsFailures,
                                skipped: 0,
                                coverage: 0],
-                       docker: [build_status: env.DOCKER_BUILD_STATUS,
+                       docker: [build_status: dockerBuildStatus,
                                 image_tag: env.IMAGE_NAME,
                                 push_status: 'SKIPPED'],
                        requiredStages:['build','tests','sonar','trivy','owasp','zap','docker']]
