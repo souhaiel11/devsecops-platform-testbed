@@ -18,18 +18,57 @@ pipeline {
     SONAR_ANALYSIS_ID = ''
     SONAR_QG = 'NOT_RUN'
     ZAP_STATE = 'NOT_RUN'
+    // Vérité structurée par étage, capturée AU MOMENT de l'étage (pas
+    // reconstruite depuis currentBuild.result en fin de pipeline) — un
+    // scanner en échec plus loin (Sonar/Trivy/OWASP/ZAP) ne doit jamais
+    // rétroactivement changer BUILD_STATUS/TEST_STATUS/DOCKER_BUILD_STATUS.
+    // Défaut 'UNKNOWN' (pas 'NOT_REACHED') : c'est le sentinel que
+    // Merge All Fetched Data (WF1) reconnaît déjà pour dériver NOT_REACHED
+    // côté plateforme quand buildFailed=true — convention existante,
+    // pas inventée ici (vérifié par test offline avant d'écrire ceci).
+    BUILD_STATUS = 'UNKNOWN'
+    TEST_STATUS = 'UNKNOWN'
+    TESTS_TOTAL = '0'
+    TESTS_FAILURES = '0'
+    DOCKER_BUILD_STATUS = 'UNKNOWN'
   }
   stages {
     stage('Build') {
-      steps { sh 'mvn -B clean package -DskipTests -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
+      steps {
+        script {
+          try {
+            sh 'mvn -B clean package -DskipTests -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+            env.BUILD_STATUS = 'SUCCESS'
+          } catch (e) {
+            env.BUILD_STATUS = 'FAILED'
+            throw e
+          }
+        }
+      }
     }
     stage('Tests') {
       steps {
         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-          sh 'mvn -B test -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+          script {
+            try {
+              sh 'mvn -B test -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+              env.TEST_STATUS = 'SUCCESS'
+            } catch (e) {
+              env.TEST_STATUS = 'FAILED'
+              throw e
+            }
+          }
         }
       }
-      post { always { junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml' } }
+      post {
+        always {
+          script {
+            def summary = junit(allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml')
+            env.TESTS_TOTAL = "${summary.totalCount}"
+            env.TESTS_FAILURES = "${summary.failCount}"
+          }
+        }
+      }
     }
     stage('SAST - SonarQube') {
       steps {
@@ -62,7 +101,17 @@ pipeline {
       }
     }
     stage('Docker Build') {
-      steps { sh 'docker build -t "$IMAGE_NAME" .' }
+      steps {
+        script {
+          try {
+            sh 'docker build -t "$IMAGE_NAME" .'
+            env.DOCKER_BUILD_STATUS = 'SUCCESS'
+          } catch (e) {
+            env.DOCKER_BUILD_STATUS = 'FAILED'
+            throw e
+          }
+        }
+      }
     }
     stage('Security Scans') {
       parallel {
@@ -151,6 +200,19 @@ pipeline {
                        analysisId: env.SONAR_ANALYSIS_ID ?: null,
                        sonarQualityGate: env.SONAR_QG,
                        zapState: env.ZAP_STATE,
+                       // Vérité structurée par étage (scope de ce fix : BUILD/TESTS/DOCKER
+                       // uniquement) — buildStageStatus est un champ dédié, distinct de
+                       // jenkinsStatus (résultat global du pipeline) pour ne jamais confondre
+                       // "Build a réussi" avec "le pipeline global est UNSTABLE à cause de Sonar".
+                       buildStageStatus: env.BUILD_STATUS,
+                       tests: [status: env.TEST_STATUS,
+                               total: (env.TESTS_TOTAL ?: '0') as Integer,
+                               failures: (env.TESTS_FAILURES ?: '0') as Integer,
+                               skipped: 0,
+                               coverage: 0],
+                       docker: [build_status: env.DOCKER_BUILD_STATUS,
+                                image_tag: env.IMAGE_NAME,
+                                push_status: 'SKIPPED'],
                        requiredStages:['build','tests','sonar','trivy','owasp','zap','docker']]
         writeFile file: 'platform-event.json', text: JsonOutput.toJson(payload)
         withCredentials([string(credentialsId: 'N8N_API_KEY', variable: 'N8N_API_KEY')]) {
