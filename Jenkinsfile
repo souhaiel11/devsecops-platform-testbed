@@ -1,5 +1,4 @@
 import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
 
 // ── Vérité structurée par étage (CPS-safe, hors environment{}) ─────────
 // Root cause confirmée sur build #10 : les variables déclarées dans le
@@ -90,6 +89,17 @@ pipeline {
     // d'ici, voir les `def` top-level en tête de fichier — cause racine
     // du bug ZAP_STATE=NOT_RUN sur build #12 (QA-SCANNER-RUNTIME-TRUTH-
     // CORRECTION-R1 §ZAP).
+    // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §8 : ces deux chemins pointent
+    // vers le MÊME volume nommé shared_reports (docker-compose.yml), monté
+    // à des points différents dans les conteneurs jenkins et n8n. Sans ça,
+    // WF1 cherche les rapports sous /home/node/.n8n-files/reports/... et
+    // ne les trouve jamais, puisque ce Jenkinsfile ne les y copiait pas
+    // (preuve : pfe-app-test, la référence qui fonctionne, le fait via
+    // REPORT_BASE/N8N_REPORT_BASE — même volume partagé, même convention).
+    // Statiques (JOB_NAME/BUILD_NUMBER ne changent pas en cours de build) :
+    // pas concernés par le bug de ré-évaluation environment{} ci-dessus.
+    REPORT_BASE = "/shared/reports/${JOB_NAME}/${BUILD_NUMBER}"
+    N8N_REPORT_BASE = "/home/node/.n8n-files/reports/${JOB_NAME}/${BUILD_NUMBER}"
   }
   stages {
     stage('Build') {
@@ -140,19 +150,29 @@ pipeline {
             script {
               sonarCeTaskId = sh(returnStdout: true, script: "sed -n 's/^ceTaskId=//p' target/sonar/report-task.txt | head -1").trim()
               if (!sonarCeTaskId) { error('Sonar report-task.txt missing ceTaskId') }
+              // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §Sonar : `new JsonSlurperClassic()`
+              // est une instanciation Groovy brute — le sandbox Script Security la
+              // rejette (RejectedAccessException, preuve build #13 :
+              // "Scripts not permitted to use new groovy.json.JsonSlurperClassic"),
+              // ce qui invalide TOUTE la corrélation ceTaskId/analysisId/Quality Gate
+              // même quand Sonar lui-même répond correctement. `readJSON` est un step
+              // Pipeline (plugin pipeline-utility-steps, déjà installé) : approuvé par
+              // construction, jamais soumis à ce whitelisting. Le Map retourné n'est
+              // utilisé que de façon synchrone ici, jamais retenu dans une var
+              // top-level — même règle de sûreté CPS que le reste du fichier.
               timeout(time: 5, unit: 'MINUTES') {
                 waitUntil {
                   def ce = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/ce/task?id=${sonarCeTaskId}\"").trim()
-                  def status = (new JsonSlurperClassic().parseText(ce)?.task?.status ?: '').toString()
+                  def status = (readJSON(text: ce)?.task?.status ?: '').toString()
                   if (status == 'FAILED' || status == 'CANCELED') { error("Sonar CE task ${status}") }
                   return status == 'SUCCESS'
                 }
               }
               def ceFinal = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/ce/task?id=${sonarCeTaskId}\"").trim()
-              sonarAnalysisId = (new JsonSlurperClassic().parseText(ceFinal)?.task?.analysisId ?: '').toString()
+              sonarAnalysisId = (readJSON(text: ceFinal)?.task?.analysisId ?: '').toString()
               if (!sonarAnalysisId) { error('Sonar CE SUCCESS without analysisId') }
               def qg = sh(returnStdout: true, script: "curl -fsS -u \"${SONAR_AUTH_TOKEN}:\" \"${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${sonarAnalysisId}\"").trim()
-              sonarQualityGate = (new JsonSlurperClassic().parseText(qg)?.projectStatus?.status ?: 'API_ERROR').toString()
+              sonarQualityGate = (readJSON(text: qg)?.projectStatus?.status ?: 'API_ERROR').toString()
               if (params.JENKINS_HARD_GATE && sonarQualityGate != 'OK') { error("Quality Gate: ${sonarQualityGate}") }
             }
           }
@@ -180,11 +200,34 @@ pipeline {
               script {
                 owaspExecuted = true
                 withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_API_KEY')]) {
-                  def raw = sh(returnStdout: true, script: '''mvn -B org.owasp:dependency-check-maven:12.2.2:check \\
-                    -DnvdApiKey="$NVD_API_KEY" \\
-                    -DfailBuildOnCVSS=${CVSS_FAIL_THRESHOLD} \\
-                    -Dformats=HTML,JSON \\
-                    -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1
+                  // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §OWASP : preuve build #13 —
+                  // "NvdApiException: Invalid API Key" survient au tout premier appel
+                  // NVD, sur une base locale totalement vide ("NoDataException: No
+                  // documents exist") : cette étape ne persistait jamais sa base NVD
+                  // (pas de -DdataDirectory) et retentait donc un appel réseau live à
+                  // chaque build, sans délai/retry. pfe-app-test (référence) sépare
+                  // la mise à jour (tolérante, délai 2s, 15 retries, cache valide
+                  // 7 jours) de la vérification (offline, -DautoUpdate=false) sur un
+                  // répertoire PERSISTANT (/var/jenkins_home, même volume que le
+                  // cache Maven) : la plupart des builds ne recontactent alors jamais
+                  // NVD. Reprise ici à l'identique, sans changer la sémantique
+                  // owaspExitCode/owaspCompleted déjà en place.
+                  def raw = sh(returnStdout: true, script: '''ODC_DATA="/var/jenkins_home/dependency-check-data-v12"
+                    mkdir -p "$ODC_DATA"
+                    mvn -B org.owasp:dependency-check-maven:12.2.2:update-only \\
+                      -DdataDirectory="$ODC_DATA" \\
+                      -DnvdApiKey="$NVD_API_KEY" \\
+                      -DnvdApiDelay=2000 \\
+                      -DnvdMaxRetryCount=15 \\
+                      -DnvdValidForHours=168 \\
+                      -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
+                    mvn -B org.owasp:dependency-check-maven:12.2.2:check \\
+                      -DdataDirectory="$ODC_DATA" \\
+                      -DautoUpdate=false \\
+                      -DnvdApiKey="$NVD_API_KEY" \\
+                      -DfailBuildOnCVSS=${CVSS_FAIL_THRESHOLD} \\
+                      -Dformats=HTML,JSON \\
+                      -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1
                     echo "__OWASP_EXIT__=$?"''').trim()
                   def lines = raw.readLines()
                   def last = lines ? lines[-1] : ''
@@ -200,6 +243,10 @@ pipeline {
                     owaspTechnicalCode = classifyScannerFailure(body)
                     owaspMessage = redactSecrets(body.readLines().findAll { it.trim() }.reverse().take(6).reverse().join(' | '))
                   }
+                  // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §8 : copie vers le volume
+                  // partagé jenkins<->n8n, quel que soit le statut — WF1 doit pouvoir
+                  // lire le rapport même sur une étape marquée FAILURE par le gate CVSS.
+                  sh 'mkdir -p "$N8N_REPORT_BASE" && cp -f target/dependency-check-report.json "$N8N_REPORT_BASE/dependency-check-report.json" 2>/dev/null || true'
                   if (owaspExitCode != 0) { error("OWASP Dependency-Check failed (exit ${owaspExitCode})") }
                 }
               }
@@ -211,10 +258,24 @@ pipeline {
             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
               script {
                 trivyExecuted = true
+                // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §Trivy : cette étape ne
+                // persistait pas la base de vulnérabilités (pas de volume cache),
+                // donc chaque build retéléchargeait la DB complète sous le timeout
+                // par défaut de trivy (5 min) — cause historique du "context
+                // deadline exceeded". pfe-app-test (référence) sépare le
+                // téléchargement (tolérant, --download-db-only || true, volume
+                // nommé persistant) du scan proprement dit (--skip-db-update,
+                // --timeout 30m). Reprise ici à l'identique ; le marqueur
+                // __TRIVY_EXIT__ et la sémantique trivyExitCode ne changent pas.
+                sh 'docker volume create trivy-cache >/dev/null || true'
+                sh(returnStatus: true, script: '''docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
+                  -v trivy-cache:/root/.cache aquasec/trivy:0.66.0 image --download-db-only 2>&1 || true''')
                 def raw = sh(returnStdout: true, script: '''mkdir -p security
                 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
+                  -v trivy-cache:/root/.cache \\
                   -v "$WORKSPACE/security:/out" aquasec/trivy:0.66.0 image \\
                   --exit-code 0 --severity CRITICAL,HIGH --format json \\
+                  --skip-db-update --no-progress --timeout 30m \\
                   --output /out/trivy-report.json "$IMAGE_NAME" 2>&1
                 echo "__TRIVY_EXIT__=$?"''').trim()
                 def lines = raw.readLines()
@@ -231,6 +292,9 @@ pipeline {
                   trivyTechnicalCode = classifyScannerFailure(body)
                   trivyMessage = body.readLines().findAll { it.trim() }.reverse().take(6).reverse().join(' | ')
                 }
+                // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §8 : copie vers le volume
+                // partagé jenkins<->n8n (voir REPORT_BASE/N8N_REPORT_BASE).
+                sh 'mkdir -p "$N8N_REPORT_BASE" && cp -f security/trivy-report.json "$N8N_REPORT_BASE/trivy-report.json" 2>/dev/null || true'
                 if (trivyExitCode != 0) { error("Trivy scan failed (exit ${trivyExitCode})") }
               }
             }
@@ -247,8 +311,24 @@ pipeline {
             // Le conteneur a démarré : la tentative ZAP a réellement commencé
             // à cet instant, indépendamment de l'issue du healthcheck ci-dessous.
             zapState = 'RUNNING'
+            // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §ZAP : preuve build #13 — le
+            // conteneur cible démarre et logue "Tomcat started on port 8080" /
+            // "Started TestbedApplication" en ~2s (zap-target-application.log),
+            // et pourtant les 12 tentatives échouent sur les 60s complètes. Cause :
+            // DOCKER_HOST=tcp://docker:2376 pointe vers le moteur Docker-in-Docker
+            // (conteneur jenkins-docker) — "docker run --network pfe-network" y crée
+            // le conteneur cible DANS le réseau interne de CE moteur imbriqué. Le
+            // process qui exécute ce `curl` tourne, lui, dans le conteneur `jenkins`
+            // lui-même (l'agent Pipeline), qui est sur un `pfe-network` distinct côté
+            // moteur hôte — même nom, bridge Docker différent, aucune route entre
+            // les deux. Le sondage doit donc lui-même être un conteneur lancé via
+            // DOCKER_HOST (comme le `docker run -d` ci-dessus), pas un process
+            // Jenkins direct : c'est le mécanisme réel utilisé par pfe-app-test
+            // (référence) — son sondage HTTP tourne dans le pod ZAP lui-même,
+            // jamais depuis l'agent Jenkins.
             def ready = sh(returnStatus: true, script: '''for i in $(seq 1 12); do
-              curl -sf "http://${ZAP_CONTAINER}:8080/healthz" >/dev/null && exit 0
+              docker run --rm --network pfe-network curlimages/curl:8.11.1 \\
+                -sf "http://${ZAP_CONTAINER}:8080/healthz" >/dev/null 2>&1 && exit 0
               sleep 5
             done
             exit 1''') == 0
@@ -282,6 +362,9 @@ pipeline {
               zaproxy/zap-stable:2.16.1 zap-baseline.py \\
               -t "http://${ZAP_CONTAINER}:8080" -J zap-report.json -I || true'''
             zapState = fileExists('security/zap/zap-report.json') ? 'COMPLETED' : 'FAILED'
+            // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §8 : copie vers le volume
+            // partagé jenkins<->n8n (voir REPORT_BASE/N8N_REPORT_BASE).
+            sh 'mkdir -p "$N8N_REPORT_BASE" && cp -f security/zap/zap-report.json "$N8N_REPORT_BASE/zap-report.json" 2>/dev/null || true'
           }
         }
       }
@@ -337,6 +420,21 @@ pipeline {
                              resultAvailable: (zapState == 'COMPLETED' && fileExists('security/zap/zap-report.json')),
                              status: zapState,
                              technicalCode: (zapState == 'TARGET_UNAVAILABLE' ? 'TARGET_UNAVAILABLE' : null)],
+                       // QA-JENKINSFILE-REFERENCE-ALIGNMENT-R1 §8 : champ prioritaire
+                       // n°1 dans la résolution de chemin de WF1 (Fetch Trivy/ZAP/OWASP
+                       // Report1 nodes) — sans lui, WF1 retombe sur la reconstruction
+                       // /home/node/.n8n-files/reports/${job}/${build_number}/... qui,
+                       // avant cette correction, ne correspondait à aucun fichier
+                       // réellement écrit par ce Jenkinsfile (les rapports restaient
+                       // dans le workspace). Additif — n'écrase aucun champ ci-dessus.
+                       reports: [jenkinsBasePath: env.REPORT_BASE,
+                                 basePath       : env.N8N_REPORT_BASE,
+                                 trivyPath      : "${env.N8N_REPORT_BASE}/trivy-report.json",
+                                 zapPath        : "${env.N8N_REPORT_BASE}/zap-report.json",
+                                 owaspPath      : "${env.N8N_REPORT_BASE}/dependency-check-report.json",
+                                 available      : [ trivy: trivyResultAvailable,
+                                                     zap: (zapState == 'COMPLETED'),
+                                                     owasp: owaspResultAvailable ]],
                        requiredStages:['build','tests','sonar','trivy','owasp','zap','docker']]
         writeFile file: 'platform-event.json', text: JsonOutput.toJson(payload)
         withCredentials([string(credentialsId: 'N8N_API_KEY', variable: 'N8N_API_KEY')]) {
